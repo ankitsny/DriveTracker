@@ -49,8 +49,14 @@ class DriveTrackingService : Service(), SensorEventListener {
     private var lastStopStart = 0L
     private var isStopped = true
     private var stopsCount = 0
+    private var stopCandidateStart = 0L   // time we first dropped below STOP_ENTRY_KMH
     private var topSpeedKmh = 0f
     private var topCornerSpeedKmh = 0f
+
+    // Stop detection thresholds
+    private val STOP_ENTRY_KMH = 3f        // below this → candidate for stop
+    private val STOP_EXIT_KMH  = 7f        // above this → definitely moving again
+    private val STOP_MIN_MS    = 4_000L    // must hold still for 4 s to count as a stop
 
     // Accelerometer state
     private var maxAccelMs2 = 0f
@@ -204,16 +210,24 @@ class DriveTrackingService : Service(), SensorEventListener {
             val now = System.currentTimeMillis()
             val currentDuration = now - sessionStartTime - totalPausedTimeMs
 
-            // Stop detection — fixed: only accumulate on transition back to moving
-            if (speedKmh < 3f) {
+            // Stop detection — minimum duration + hysteresis
+            // Entry: < STOP_ENTRY_KMH for at least STOP_MIN_MS  → confirmed stop
+            // Exit:  > STOP_EXIT_KMH                            → moving again
+            if (speedKmh < STOP_ENTRY_KMH) {
                 if (!isStopped) {
-                    isStopped = true
-                    lastStopStart = now
-                    stopsCount++
+                    if (stopCandidateStart == 0L) stopCandidateStart = now
+                    if (now - stopCandidateStart >= STOP_MIN_MS) {
+                        isStopped = true
+                        lastStopStart = stopCandidateStart
+                        stopsCount++
+                        stopCandidateStart = 0L
+                    }
                 }
-            } else {
+            } else if (speedKmh > STOP_EXIT_KMH) {
+                stopCandidateStart = 0L
                 if (isStopped && lastStopStart > 0L) {
                     stoppedTimeMs += (now - lastStopStart)
+                    lastStopStart = 0L
                 }
                 isStopped = false
             }
@@ -443,6 +457,7 @@ class DriveTrackingService : Service(), SensorEventListener {
         lastLocation = null
         was0 = false
         isStopped = true
+        stopCandidateStart = 0L
         inTurn = false
         turnDirection = 0
         currentLinAccel = 0f
