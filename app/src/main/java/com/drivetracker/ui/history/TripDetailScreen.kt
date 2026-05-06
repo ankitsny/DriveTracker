@@ -40,7 +40,10 @@ import com.drivetracker.ui.theme.TextPrimary
 import com.drivetracker.ui.theme.TextSecondary
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 import java.text.SimpleDateFormat
@@ -50,29 +53,76 @@ import java.util.*
 class TripDetailViewModel @Inject constructor(
     private val repository: DriveRepository
 ) : ViewModel() {
-    private val _points = MutableStateFlow<List<DriveDataPoint>>(emptyList())
+    private val _points  = MutableStateFlow<List<DriveDataPoint>>(emptyList())
     val points: StateFlow<List<DriveDataPoint>> = _points
 
     private val _session = MutableStateFlow<DriveSession?>(null)
-    val session: StateFlow<DriveSession?> = _session
+
+    // Merge session record with stats computed from data points.
+    // If the session was saved as a skeleton (all zeros due to old bug), we fill in
+    // every recoverable field from the data-point stream instead.
+    val session: StateFlow<DriveSession?> = combine(_session, _points) { s, pts ->
+        if (s == null || pts.isEmpty()) return@combine s
+        // Session already has real data — nothing to repair
+        if (s.distanceKm > 0f || s.durationMs > 0L) return@combine s
+        s.repairFromPoints(pts)
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), null)
 
     fun loadTrip(sessionId: Long) {
         viewModelScope.launch {
-            repository.getSessionById(sessionId).collect { s ->
-                _session.value = s
-            }
+            repository.getSessionById(sessionId).collect { s -> _session.value = s }
         }
         viewModelScope.launch {
-            repository.getSessionDataPoints(sessionId).collect { p ->
-                _points.value = p
-            }
+            repository.getSessionDataPoints(sessionId).collect { p -> _points.value = p }
         }
     }
 
     fun deleteTrip(session: DriveSession) {
-        viewModelScope.launch {
-            repository.deleteSession(session)
+        viewModelScope.launch { repository.deleteSession(session) }
+    }
+
+    private fun DriveSession.repairFromPoints(pts: List<DriveDataPoint>): DriveSession {
+        val gps = pts.filter { it.latitude != 0.0 && it.longitude != 0.0 }
+
+        // Distance — sum of consecutive GPS point gaps
+        var distM = 0f
+        gps.zipWithNext { a, b ->
+            val out = FloatArray(1)
+            android.location.Location.distanceBetween(
+                a.latitude, a.longitude, b.latitude, b.longitude, out
+            )
+            distM += out[0]
         }
+
+        // Stopped time — sum of segments where speed < 3 km/h
+        var stoppedMs = 0L
+        pts.zipWithNext { a, b ->
+            if (a.speedKmh < 3f && b.speedKmh < 3f) stoppedMs += (b.timestamp - a.timestamp)
+        }
+
+        return copy(
+            distanceKm       = distM / 1000f,
+            durationMs       = if (pts.size >= 2) pts.last().timestamp - pts.first().timestamp else 0L,
+            stoppedTimeMs    = stoppedMs,
+            topSpeedKmh      = pts.maxOf { it.speedKmh },
+            maxAccelerationMs2 = pts.maxOf { it.linAccel },
+            maxDecelerationMs2 = pts.maxOf { it.linAccel },
+            peakGForce       = pts.maxOf { it.gForce },
+            brakeEvents      = pts.count { it.isHardBrake },
+            leftTurns        = pts.count { it.isSharpTurn } / 2,
+            rightTurns       = pts.count { it.isSharpTurn } - (pts.count { it.isSharpTurn } / 2),
+            safetyScore      = run {
+                val brakes = pts.count { it.isHardBrake }
+                val peakG  = pts.maxOf { it.gForce }
+                val s = 100 - (brakes * 5).coerceAtMost(25) - when {
+                    peakG > 1.2f -> 20
+                    peakG > 0.9f -> 12
+                    peakG > 0.7f -> 5
+                    else -> 0
+                }
+                s.coerceIn(0, 100)
+            }
+        )
     }
 }
 
