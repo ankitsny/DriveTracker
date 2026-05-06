@@ -1,0 +1,2 @@
+-keep class com.drivetracker.data.** { *; }
+-keep class com.drivetracker.sensors.** { *; }
