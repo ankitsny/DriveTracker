@@ -1,10 +1,10 @@
 package com.drivetracker.ui.ongoing
 
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Pause
@@ -14,14 +14,14 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.drivetracker.data.model.LiveDriveData
 import com.drivetracker.ui.theme.AccentTeal
+import com.drivetracker.ui.theme.CardBackground
 import com.drivetracker.ui.theme.DarkBackground
 import com.drivetracker.ui.theme.TextPrimary
 import com.drivetracker.ui.theme.TextSecondary
@@ -34,10 +34,53 @@ fun OngoingTripScreen(
     onPauseToggle: () -> Unit,
     onStopTrip: () -> Unit
 ) {
+    val safetyGradeColor = when {
+        liveData.safetyScore >= 90 -> Color(0xFF34C759)
+        liveData.safetyScore >= 75 -> Color(0xFF30D158)
+        liveData.safetyScore >= 60 -> Color(0xFFFF9500)
+        liveData.safetyScore >= 45 -> Color(0xFFFF6B00)
+        else -> Color(0xFFFF3B30)
+    }
+    val safetyGrade = when {
+        liveData.safetyScore >= 90 -> "A"
+        liveData.safetyScore >= 75 -> "B"
+        liveData.safetyScore >= 60 -> "C"
+        liveData.safetyScore >= 45 -> "D"
+        else -> "F"
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Ongoing Trip", color = TextPrimary, fontWeight = FontWeight.Bold) },
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Ongoing Trip", color = TextPrimary, fontWeight = FontWeight.Bold)
+                        if (isPaused) {
+                            Spacer(Modifier.width(8.dp))
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(Color(0xFFFF9500).copy(alpha = 0.2f))
+                                    .padding(horizontal = 8.dp, vertical = 2.dp)
+                            ) {
+                                Text("PAUSED", color = Color(0xFFFF9500), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                },
+                actions = {
+                    // Live safety score in header
+                    Box(
+                        modifier = Modifier
+                            .padding(end = 16.dp)
+                            .size(40.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(safetyGradeColor.copy(alpha = 0.15f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(safetyGrade, color = safetyGradeColor, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = DarkBackground)
             )
         },
@@ -48,26 +91,26 @@ fun OngoingTripScreen(
                     onClick = onPauseToggle,
                     containerColor = if (isPaused) Color(0xFF34C759) else Color(0xFFFF9500),
                     shape = CircleShape,
-                    modifier = Modifier.size(72.dp)
+                    modifier = Modifier.size(64.dp)
                 ) {
                     Icon(
                         if (isPaused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
                         contentDescription = if (isPaused) "Resume Trip" else "Pause Trip",
                         tint = Color.White,
-                        modifier = Modifier.size(36.dp)
+                        modifier = Modifier.size(32.dp)
                     )
                 }
                 FloatingActionButton(
                     onClick = onStopTrip,
                     containerColor = Color(0xFFFF3B30),
                     shape = CircleShape,
-                    modifier = Modifier.size(72.dp)
+                    modifier = Modifier.size(64.dp)
                 ) {
                     Icon(
                         Icons.Filled.Stop,
                         contentDescription = "Stop Trip",
                         tint = Color.White,
-                        modifier = Modifier.size(36.dp)
+                        modifier = Modifier.size(32.dp)
                     )
                 }
             }
@@ -79,77 +122,118 @@ fun OngoingTripScreen(
                 .fillMaxSize()
                 .padding(paddingValues)
                 .verticalScroll(rememberScrollState())
-                .padding(16.dp),
+                .padding(horizontal = 16.dp, vertical = 8.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // Speed
+            // Big speed display
             Text(
                 text = "${liveData.speedKmh.toInt()}",
-                color = TextPrimary,
-                fontSize = 80.sp,
+                color = if (isPaused) TextSecondary else TextPrimary,
+                fontSize = 96.sp,
                 fontWeight = FontWeight.Bold
             )
             Text("km/h", color = TextSecondary, fontSize = 18.sp)
-            Spacer(modifier = Modifier.height(32.dp))
-
-            // Primary Stats row
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly
-            ) {
-                LiveStat("Distance", "${"%.1f".format(liveData.distanceKm)} km")
-                
-                val hours = liveData.durationMs / 3_600_000
-                val minutes = (liveData.durationMs % 3_600_000) / 60_000
-                val durationString = if (hours > 0) "${hours}h ${minutes}m" else "${minutes}m"
-                LiveStat("Duration", durationString)
-                
-                LiveStat("Avg Speed", "${"%.1f".format(liveData.avgSpeedKmh)} km/h")
-            }
             Spacer(modifier = Modifier.height(24.dp))
 
-            // Secondary Stats Grid
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly
-            ) {
+            // Primary stats
+            LiveStatRow {
+                LiveStat("Distance", "${"%.2f".format(liveData.distanceKm)} km")
+                val h = liveData.durationMs / 3_600_000
+                val m = (liveData.durationMs % 3_600_000) / 60_000
+                val s = (liveData.durationMs % 60_000) / 1_000
+                LiveStat("Duration", if (h > 0) "${h}h ${m}m" else "${m}m ${s}s")
+                LiveStat("Avg Speed", "${"%.1f".format(liveData.avgSpeedKmh)} km/h")
+            }
+            Spacer(Modifier.height(12.dp))
+
+            // Turn & stop stats
+            LiveStatRow {
                 LiveStat("Stops", "${liveData.stopsCount}")
                 LiveStat("Left Turns", "${liveData.leftTurns}")
                 LiveStat("Right Turns", "${liveData.rightTurns}")
             }
-            Spacer(modifier = Modifier.height(24.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly
-            ) {
+            Spacer(Modifier.height(12.dp))
+
+            // G-force & accel stats
+            LiveStatRow {
                 LiveStat("Max Accel", "${"%.1f".format(liveData.maxAccelMs2)} m/s²")
                 LiveStat("Max Decel", "${"%.1f".format(liveData.maxDecelMs2)} m/s²")
                 LiveStat("Peak G", "${"%.2f".format(liveData.peakGForce)} G")
             }
-            Spacer(modifier = Modifier.height(24.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly
-            ) {
+            Spacer(Modifier.height(12.dp))
+
+            // Lane changes + corner speed
+            LiveStatRow {
                 val stoppedMins = liveData.stoppedTimeMs / 60000
-                LiveStat("Stopped Time", "${stoppedMins}m")
+                LiveStat("Stopped", "${stoppedMins}m")
+                LiveStat("Hard Brakes", "${liveData.brakeEvents}")
                 LiveStat("Top Corner", "${liveData.topCornerSpeedKmh.toInt()} km/h")
             }
 
-            Spacer(modifier = Modifier.height(40.dp))
+            Spacer(modifier = Modifier.height(16.dp))
 
-            Spacer(modifier = Modifier.height(100.dp)) // Padding for FAB
+            // Safety score card
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(CardBackground)
+                    .padding(16.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column {
+                        Text("Safety Score", color = TextSecondary, fontSize = 13.sp)
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "${liveData.safetyScore}/100",
+                            color = safetyGradeColor,
+                            fontSize = 28.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .size(56.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(safetyGradeColor.copy(alpha = 0.15f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(safetyGrade, color = safetyGradeColor, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(120.dp)) // Padding for FABs
         }
+    }
+}
+
+@Composable
+fun LiveStatRow(content: @Composable RowScope.() -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(CardBackground)
+            .padding(vertical = 14.dp, horizontal = 8.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            content = content
+        )
     }
 }
 
 @Composable
 fun LiveStat(label: String, value: String) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(text = label, color = TextSecondary, fontSize = 12.sp)
+        Text(text = label, color = TextSecondary, fontSize = 11.sp)
         Spacer(modifier = Modifier.height(4.dp))
-        Text(text = value, color = TextPrimary, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+        Text(text = value, color = TextPrimary, fontSize = 17.sp, fontWeight = FontWeight.Bold)
     }
 }
-
-

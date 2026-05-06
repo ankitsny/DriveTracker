@@ -36,13 +36,17 @@ interface DriveSessionDao {
             COALESCE(MAX(maxDecelerationMs2), 0) as maxDecelerationMs2,
             COALESCE(MAX(maxAccelerationMs2), 0) as maxAccelerationMs2,
             COALESCE(MAX(peakGForce), 0) as peakGForce,
-            COALESCE(MAX(topCornerSpeedKmh), 0) as topCornerSpeedKmh
+            COALESCE(MAX(topCornerSpeedKmh), 0) as topCornerSpeedKmh,
+            COALESCE(AVG(safetyScore), 100) as avgSafetyScore
         FROM drive_sessions
     """)
     fun getAggregatedStats(): Flow<AggregatedStats>
 
     @Delete
     suspend fun deleteSession(session: DriveSession)
+
+    @Update
+    suspend fun updateSession(session: DriveSession)
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertDataPoints(points: List<DriveDataPoint>)
@@ -65,12 +69,13 @@ data class AggregatedStats(
     val maxDecelerationMs2: Float,
     val maxAccelerationMs2: Float,
     val peakGForce: Float,
-    val topCornerSpeedKmh: Float
+    val topCornerSpeedKmh: Float,
+    val avgSafetyScore: Float = 100f
 )
 
 @Database(
     entities = [DriveSession::class, DriveDataPoint::class],
-    version = 4,
+    version = 5,
     exportSchema = false
 )
 abstract class DriveDatabase : RoomDatabase() {

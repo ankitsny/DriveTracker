@@ -22,6 +22,8 @@ data class DriveSession(
     val peakGForce: Float = 0f,
     val topCornerSpeedKmh: Float = 0f,
     val best0to100Ms: Long = 0L,
+    val safetyScore: Int = 100,
+    val tripName: String = "",
     val timestamp: Long = System.currentTimeMillis()
 )
 
@@ -64,7 +66,8 @@ data class DriveStats(
     val maxAccelerationMs2: Float = 0f,
     val peakGForce: Float = 0f,
     val topCornerSpeedKmh: Float = 0f,
-    val currentSpeedKmh: Float = 0f
+    val currentSpeedKmh: Float = 0f,
+    val avgSafetyScore: Int = 100
 ) {
     val leftTurnPercentage: Float
         get() {
@@ -100,10 +103,12 @@ data class LiveDriveData(
     val stopsCount: Int = 0,
     val leftTurns: Int = 0,
     val rightTurns: Int = 0,
+    val brakeEvents: Int = 0,
     val maxAccelMs2: Float = 0f,
     val maxDecelMs2: Float = 0f,
     val peakGForce: Float = 0f,
     val topCornerSpeedKmh: Float = 0f,
+    val safetyScore: Int = 100,
     val isTracking: Boolean = false,
     val speedHistory: List<Float> = emptyList(),
     val gForceHistory: List<Float> = emptyList()

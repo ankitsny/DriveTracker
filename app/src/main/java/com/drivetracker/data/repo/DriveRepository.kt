@@ -29,7 +29,8 @@ class DriveRepository @Inject constructor(
                 maxDecelerationMs2 = agg.maxDecelerationMs2,
                 maxAccelerationMs2 = agg.maxAccelerationMs2,
                 peakGForce = agg.peakGForce,
-                topCornerSpeedKmh = agg.topCornerSpeedKmh
+                topCornerSpeedKmh = agg.topCornerSpeedKmh,
+                avgSafetyScore = agg.avgSafetyScore.toInt()
             )
         }
     }
@@ -41,6 +42,8 @@ class DriveRepository @Inject constructor(
     fun getSessionDataPoints(sessionId: Long): Flow<List<DriveDataPoint>> = dao.getDataPointsForSession(sessionId)
 
     suspend fun saveSession(session: DriveSession): Long = dao.insertSession(session)
+
+    suspend fun updateSession(session: DriveSession) = dao.updateSession(session)
 
     suspend fun saveDataPoints(points: List<DriveDataPoint>) = dao.insertDataPoints(points)
 

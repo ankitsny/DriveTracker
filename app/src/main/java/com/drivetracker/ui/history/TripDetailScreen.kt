@@ -289,114 +289,163 @@ fun DetailStat(label: String, value: String) {
 @Composable
 fun AdvancedLineChart(data: List<Pair<Long, Float>>, color: Color, modifier: Modifier) {
     if (data.isEmpty()) {
-        Box(modifier = modifier.background(Color(0xFF1C1C1E)))
+        Box(modifier = modifier
+            .clip(RoundedCornerShape(16.dp))
+            .background(Color(0xFF1C1C1E)),
+            contentAlignment = Alignment.Center
+        ) {
+            Text("No data", color = TextSecondary, fontSize = 13.sp)
+        }
         return
     }
-    
-    // Downsample data to prevent hardware crash for Path complexity
-    val chartData = if (data.size > 150) {
+
+    // Downsample to max 120 points to keep Path complexity manageable
+    val chartData = if (data.size > 120) {
         val step = data.size / 100
         data.filterIndexed { index, _ -> index % step == 0 || index == data.lastIndex }
     } else data
 
     val textMeasurer = rememberTextMeasurer()
-    val maxVal = chartData.maxOfOrNull { it.second }?.coerceAtLeast(1f) ?: 1f
-    val minVal = chartData.minOfOrNull { it.second }?.coerceAtMost(0f) ?: 0f
+    val maxVal = chartData.maxOfOrNull { it.second }?.let { if (it == 0f) 1f else it * 1.1f } ?: 1f
+    val minVal = chartData.minOfOrNull { it.second }?.let { if (it > 0f) 0f else it * 1.1f } ?: 0f
     val minTime = chartData.first().first
     val maxTime = chartData.last().first
-    
+    val totalDurationMs = (maxTime - minTime).coerceAtLeast(1L)
+
     val textStyle = TextStyle(color = TextSecondary, fontSize = 10.sp)
 
-    Canvas(modifier = modifier.background(Color(0xFF1C1C1E)).padding(top = 16.dp, start = 8.dp, end = 16.dp)) {
+    fun formatTime(timestampMs: Long): String {
+        val cal = Calendar.getInstance()
+        cal.timeInMillis = timestampMs
+        val h = cal.get(Calendar.HOUR_OF_DAY)
+        val m = cal.get(Calendar.MINUTE)
+        return "${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}"
+    }
+
+    Canvas(
+        modifier = modifier
+            .clip(RoundedCornerShape(16.dp))
+            .background(Color(0xFF1C1C1E))
+            .padding(top = 20.dp, start = 4.dp, end = 8.dp)
+    ) {
         try {
-            val insetX = 40.dp.toPx()
-            val insetBottom = 20.dp.toPx()
-            val width = (size.width - insetX).coerceAtLeast(1f)
-            val height = (size.height - insetBottom).coerceAtLeast(1f)
-            val range = (maxVal - minVal).coerceAtLeast(0.001f)
+            val insetX       = 38.dp.toPx()
+            val xLabelHeight = 22.dp.toPx()
+            val width  = (size.width - insetX).coerceAtLeast(1f)
+            // Reserve the bottom slice for X-axis time labels
+            val height = (size.height - xLabelHeight).coerceAtLeast(1f)
+            val range  = (maxVal - minVal).coerceAtLeast(0.001f)
 
-            // X and Y axes
-            drawLine(
-                color = Color.DarkGray,
-                start = androidx.compose.ui.geometry.Offset(insetX, height),
-                end = androidx.compose.ui.geometry.Offset(size.width, height),
-                strokeWidth = 2f
-            )
-            drawLine(
-                color = Color.DarkGray,
-                start = androidx.compose.ui.geometry.Offset(insetX, 0f),
-                end = androidx.compose.ui.geometry.Offset(insetX, height),
-                strokeWidth = 2f
-            )
+            fun xOf(timestamp: Long) =
+                insetX + ((timestamp - minTime).toFloat() / totalDurationMs) * width
 
-            val stepX = width / (chartData.size - 1).coerceAtLeast(1).toFloat()
-            val path = Path()
-            chartData.forEachIndexed { index, pair ->
-                val x = insetX + (index * stepX)
-                val y = height - ((pair.second - minVal) / range) * height
-                if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
-            }
-            drawPath(path, color = color, style = Stroke(width = 4f))
+            fun yOf(value: Float) =
+                height - ((value - minVal) / range) * height
 
-            if (textMeasurer != null) {
-                // Draw Max/Min Y
-                drawText(
-                    textMeasurer = textMeasurer,
-                    text = "${maxVal.toInt()}",
-                    style = textStyle,
-                    topLeft = androidx.compose.ui.geometry.Offset(0f, -10.dp.toPx())
+            // --- Horizontal grid lines (4 levels) ---
+            val numHLines = 4
+            for (i in 0..numHLines) {
+                val fraction = i.toFloat() / numHLines
+                val y = fraction * height
+                val lineColor = if (i == numHLines) Color.White.copy(alpha = 0.15f)
+                                else Color.White.copy(alpha = 0.05f)
+                drawLine(
+                    color = lineColor,
+                    start = androidx.compose.ui.geometry.Offset(insetX, y),
+                    end   = androidx.compose.ui.geometry.Offset(size.width, y),
+                    strokeWidth = if (i == numHLines) 1.5f else 1f
                 )
-                drawText(
-                    textMeasurer = textMeasurer,
-                    text = "${minVal.toInt()}",
-                    style = textStyle,
-                    topLeft = androidx.compose.ui.geometry.Offset(0f, height - 10.dp.toPx())
-                )
-
-                val format = java.text.SimpleDateFormat("mm:ss", java.util.Locale.getDefault())
-
-                // X-axis time grid
-                val numLabels = 4
-                for (i in 1 until numLabels) {
-                    val fraction = i.toFloat() / numLabels
-                    val gridX = insetX + fraction * width
-                    drawLine(
-                        color = Color.DarkGray.copy(alpha = 0.3f),
-                        start = androidx.compose.ui.geometry.Offset(gridX, 0f),
-                        end = androidx.compose.ui.geometry.Offset(gridX, height),
-                        strokeWidth = 1f
-                    )
-                    
-                    val time = minTime + (fraction * (maxTime - minTime)).toLong()
-                    val timeStr = format.format(java.util.Date(time))
-                    val layout = textMeasurer.measure(timeStr, style = textStyle)
+                // Y-axis value label
+                val yVal = maxVal - fraction * range
+                if (i < numHLines) {
                     drawText(
                         textMeasurer = textMeasurer,
-                        text = timeStr,
+                        text = "${yVal.toInt()}",
                         style = textStyle,
-                        topLeft = androidx.compose.ui.geometry.Offset(gridX - layout.size.width / 2, height + 4.dp.toPx())
+                        topLeft = androidx.compose.ui.geometry.Offset(0f, y - 7.dp.toPx())
                     )
                 }
+            }
 
-                // Draw Start/End X (Time)
-                val startStr = format.format(java.util.Date(minTime))
-                val endStr = format.format(java.util.Date(maxTime))
-                
-                drawText(
-                    textMeasurer = textMeasurer,
-                    text = startStr,
-                    style = textStyle,
-                    topLeft = androidx.compose.ui.geometry.Offset(insetX, height + 4.dp.toPx())
+            // --- Vertical time grid (every 25% of duration) ---
+            val numVLines = 4
+            for (i in 0..numVLines) {
+                val fraction = i.toFloat() / numVLines
+                val x = insetX + fraction * width
+                drawLine(
+                    color = Color.White.copy(alpha = 0.06f),
+                    start = androidx.compose.ui.geometry.Offset(x, 0f),
+                    end   = androidx.compose.ui.geometry.Offset(x, height),
+                    strokeWidth = 1f
                 )
-                
-                val endTextLayout = textMeasurer.measure(endStr, style = textStyle)
+                val elapsedMs = (fraction * totalDurationMs).toLong()
+                val label = formatTime(minTime + elapsedMs)
+                val layout = textMeasurer.measure(label, style = textStyle)
+                val labelX = (x - layout.size.width / 2f).coerceIn(insetX, size.width - layout.size.width)
+                // Draw inside the reserved bottom label slice (below chart height)
                 drawText(
                     textMeasurer = textMeasurer,
-                    text = endStr,
+                    text = label,
                     style = textStyle,
-                    topLeft = androidx.compose.ui.geometry.Offset(size.width - endTextLayout.size.width, height + 4.dp.toPx())
+                    topLeft = androidx.compose.ui.geometry.Offset(labelX, height + 4.dp.toPx())
                 )
             }
+
+            // --- Build smooth bezier line & gradient fill paths ---
+            val linePath  = Path()
+            val fillPath  = Path()
+
+            chartData.forEachIndexed { index, pair ->
+                val x = xOf(pair.first)
+                val y = yOf(pair.second)
+                if (index == 0) {
+                    linePath.moveTo(x, y)
+                    fillPath.moveTo(x, height)
+                    fillPath.lineTo(x, y)
+                } else {
+                    val prev  = chartData[index - 1]
+                    val prevX = xOf(prev.first)
+                    val prevY = yOf(prev.second)
+                    val cpX   = (prevX + x) / 2f
+                    // Smooth cubic bezier — control points share same Y as endpoints
+                    linePath.cubicTo(cpX, prevY, cpX, y, x, y)
+                    fillPath.cubicTo(cpX, prevY, cpX, y, x, y)
+                }
+            }
+
+            // Close fill path along the bottom
+            val lastX = xOf(chartData.last().first)
+            fillPath.lineTo(lastX, height)
+            fillPath.close()
+
+            // --- Draw gradient fill under the curve ---
+            drawPath(
+                path  = fillPath,
+                brush = androidx.compose.ui.graphics.Brush.verticalGradient(
+                    colors = listOf(color.copy(alpha = 0.35f), Color.Transparent),
+                    startY = 0f,
+                    endY   = height
+                )
+            )
+
+            // --- Draw the line itself ---
+            drawPath(
+                path  = linePath,
+                color = color,
+                style = Stroke(
+                    width = 3.dp.toPx(),
+                    cap   = androidx.compose.ui.graphics.StrokeCap.Round,
+                    join  = androidx.compose.ui.graphics.StrokeJoin.Round
+                )
+            )
+
+            // --- Draw a glowing dot at the last point ---
+            val lastY = yOf(chartData.last().second)
+            drawCircle(color = color.copy(alpha = 0.3f), radius = 8.dp.toPx(),
+                center = androidx.compose.ui.geometry.Offset(lastX, lastY))
+            drawCircle(color = color, radius = 4.dp.toPx(),
+                center = androidx.compose.ui.geometry.Offset(lastX, lastY))
+
         } catch (e: Exception) {
             // Silently catch layout/hardware exceptions
         }

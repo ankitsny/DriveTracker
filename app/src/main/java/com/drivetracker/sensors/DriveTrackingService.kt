@@ -3,6 +3,7 @@ package com.drivetracker.sensors
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.hardware.Sensor
@@ -11,9 +12,10 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.location.Location
 import android.os.Binder
+import android.os.HandlerThread
 import android.os.IBinder
-import android.os.Looper
 import androidx.core.app.NotificationCompat
+import com.drivetracker.MainActivity
 import com.drivetracker.data.model.DriveDataPoint
 import com.drivetracker.data.model.DriveSession
 import com.drivetracker.data.model.LiveDriveData
@@ -33,10 +35,11 @@ class DriveTrackingService : Service(), SensorEventListener {
     @Inject lateinit var repository: DriveRepository
 
     private val binder = LocalBinder()
-    private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private lateinit var sensorManager: SensorManager
+    private lateinit var locationHandlerThread: HandlerThread
 
     // Session tracking state
     private var sessionStartTime = 0L
@@ -73,15 +76,24 @@ class DriveTrackingService : Service(), SensorEventListener {
     private var leftTurns = 0
     private var rightTurns = 0
     private var brakeEvents = 0
-    private var laneChanges = 0
 
     // Gyroscope
     private var lastGyroZ = 0f
-    private var turnThreshold = 0.5f
     private var inTurn = false
     private var turnDirection = 0
 
-    private val sessionDataPoints = mutableListOf<DriveDataPoint>()
+    private val TURN_THRESHOLD = 0.8f
+
+    // Ring buffer for live charts (max 200 points, in RAM)
+    private val recentPoints = ArrayDeque<DriveDataPoint>(200)
+    private val CHART_BUFFER_SIZE = 200
+
+    // Batch flush buffer for DB streaming writes
+    private val pendingFlush = mutableListOf<DriveDataPoint>()
+    private val FLUSH_BATCH_SIZE = 30
+
+    // Session ID resolved asynchronously after DB insert
+    private var sessionIdDeferred: CompletableDeferred<Long>? = null
 
     inner class LocalBinder : Binder() {
         fun getService(): DriveTrackingService = this@DriveTrackingService
@@ -93,6 +105,7 @@ class DriveTrackingService : Service(), SensorEventListener {
         super.onCreate()
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
         sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
+        locationHandlerThread = HandlerThread("LocationHandlerThread").also { it.start() }
         createNotificationChannel()
     }
 
@@ -103,8 +116,18 @@ class DriveTrackingService : Service(), SensorEventListener {
         lastStopStart = sessionStartTime
         totalPausedTimeMs = 0L
         _isPaused.value = false
-        sessionDataPoints.clear()
-        startForeground(NOTIFICATION_ID, buildNotification())
+        recentPoints.clear()
+        pendingFlush.clear()
+
+        // Insert a skeletal session immediately to get sessionId
+        val deferred = CompletableDeferred<Long>()
+        sessionIdDeferred = deferred
+        serviceScope.launch {
+            val id = repository.saveSession(DriveSession(tripName = generateTripName()))
+            deferred.complete(id)
+        }
+
+        startForeground(NOTIFICATION_ID, buildNotification(0f, 0f))
         startLocationUpdates()
         startSensorUpdates()
     }
@@ -114,13 +137,19 @@ class DriveTrackingService : Service(), SensorEventListener {
         if (_isPaused.value) {
             totalPausedTimeMs += (System.currentTimeMillis() - pauseStartTime)
         }
+        if (isStopped && lastStopStart > 0L) {
+            stoppedTimeMs += (System.currentTimeMillis() - lastStopStart)
+        }
         _isTracking.value = false
         _isPaused.value = false
         stopLocationUpdates()
         stopSensorUpdates()
 
         val durationMs = System.currentTimeMillis() - sessionStartTime - totalPausedTimeMs
-        val session = DriveSession(
+        val score = calculateSafetyScore()
+        val tripName = generateTripName()
+
+        val finalSession = DriveSession(
             distanceKm = totalDistanceM / 1000f,
             durationMs = durationMs,
             stoppedTimeMs = stoppedTimeMs,
@@ -128,22 +157,26 @@ class DriveTrackingService : Service(), SensorEventListener {
             leftTurns = leftTurns,
             rightTurns = rightTurns,
             brakeEvents = brakeEvents,
-            laneChanges = laneChanges,
             maxDecelerationMs2 = maxDecelMs2,
             maxAccelerationMs2 = maxAccelMs2,
             peakGForce = peakGForce,
             topCornerSpeedKmh = topCornerSpeedKmh,
-            best0to100Ms = best0to100Ms
+            best0to100Ms = best0to100Ms,
+            safetyScore = score,
+            tripName = tripName
         )
-        
-        val pointsToSave = sessionDataPoints.toList()
 
+        // Flush remaining points then update the session record
         serviceScope.launch {
-            val sessionId = repository.saveSession(session)
-            val linkedPoints = pointsToSave.map { it.copy(sessionId = sessionId) }
-            repository.saveDataPoints(linkedPoints)
+            val sessionId = sessionIdDeferred?.await() ?: return@launch
+            if (pendingFlush.isNotEmpty()) {
+                val toFlush = pendingFlush.map { it.copy(sessionId = sessionId) }
+                pendingFlush.clear()
+                repository.saveDataPoints(toFlush)
+            }
+            repository.updateSession(finalSession.copy(id = sessionId))
         }
-        
+
         resetSessionState()
         stopForeground(STOP_FOREGROUND_REMOVE)
     }
@@ -151,20 +184,17 @@ class DriveTrackingService : Service(), SensorEventListener {
     private val locationCallback = object : LocationCallback() {
         override fun onLocationResult(result: LocationResult) {
             if (_isPaused.value) return
-
             val location = result.lastLocation ?: return
             val speedKmh = location.speed * 3.6f
 
             // Top speed
             if (speedKmh > topSpeedKmh) topSpeedKmh = speedKmh
 
-            // Distance logic to prevent GPS drift
+            // Distance logic - filter GPS drift
             if (location.hasAccuracy() && location.accuracy < 20f && speedKmh > 3f) {
                 lastLocation?.let { prev ->
                     val dist = prev.distanceTo(location)
-                    if (dist > 1f) {
-                        totalDistanceM += dist
-                    }
+                    if (dist > 1f) totalDistanceM += dist
                 }
                 lastLocation = location
             } else if (speedKmh > 3f) {
@@ -174,40 +204,70 @@ class DriveTrackingService : Service(), SensorEventListener {
             val now = System.currentTimeMillis()
             val currentDuration = now - sessionStartTime - totalPausedTimeMs
 
-            // Save data point first
-            sessionDataPoints.add(
-                DriveDataPoint(
-                    sessionId = 0,
-                    timestamp = now,
-                    speedKmh = speedKmh,
-                    linAccel = currentLinAccel,
-                    gForce = currentLinAccel / SensorManager.GRAVITY_EARTH,
-                    latitude = location.latitude,
-                    longitude = location.longitude,
-                    altitude = location.altitude,
-                    isHardBrake = pendingHardBrake,
-                    isSharpTurn = pendingSharpTurn
-                )
-            )
-            pendingHardBrake = false
-            pendingSharpTurn = false
-
-            // Stop detection
+            // Stop detection — fixed: only accumulate on transition back to moving
             if (speedKmh < 3f) {
                 if (!isStopped) {
                     isStopped = true
                     lastStopStart = now
                     stopsCount++
                 }
-                stoppedTimeMs += now - lastStopStart
-                lastStopStart = now
             } else {
+                if (isStopped && lastStopStart > 0L) {
+                    stoppedTimeMs += (now - lastStopStart)
+                }
                 isStopped = false
             }
 
-            // Update live data for UI
-            val speedList = sessionDataPoints.takeLast(120).map { it.speedKmh }
-            val gForceList = sessionDataPoints.takeLast(120).map { it.gForce }
+            // Stream point to DB: add to chart ring buffer + flush buffer
+            val point = DriveDataPoint(
+                sessionId = 0, // Will be replaced on flush with real ID
+                timestamp = now,
+                speedKmh = speedKmh,
+                linAccel = currentLinAccel,
+                gForce = currentLinAccel / SensorManager.GRAVITY_EARTH,
+                latitude = location.latitude,
+                longitude = location.longitude,
+                altitude = location.altitude,
+                isHardBrake = pendingHardBrake,
+                isSharpTurn = pendingSharpTurn
+            )
+            pendingHardBrake = false
+            pendingSharpTurn = false
+
+            // Ring buffer — only last 200 points kept in RAM for charts
+            if (recentPoints.size >= CHART_BUFFER_SIZE) recentPoints.removeFirst()
+            recentPoints.addLast(point)
+
+            // Batch flush to DB — streams ALL points to disk, no eviction
+            pendingFlush.add(point)
+            if (pendingFlush.size >= FLUSH_BATCH_SIZE) {
+                val toFlush = pendingFlush.toList()
+                pendingFlush.clear()
+                serviceScope.launch {
+                    val sessionId = sessionIdDeferred?.await() ?: return@launch
+                    repository.saveDataPoints(toFlush.map { it.copy(sessionId = sessionId) })
+                }
+            }
+
+            // 0-100 tracking
+            if (speedKmh < 2f) {
+                was0 = true
+                accelStartTime = now
+            } else if (was0 && speedKmh >= 100f) {
+                val elapsed = now - accelStartTime
+                if (best0to100Ms == 0L || elapsed < best0to100Ms) best0to100Ms = elapsed
+                was0 = false
+            }
+
+            // Top corner speed
+            if (speedKmh > topCornerSpeedKmh && peakGForce > 0.3f && inTurn) {
+                topCornerSpeedKmh = speedKmh
+            }
+
+            // Build live snapshot from ring buffer
+            val speedList  = recentPoints.map { it.speedKmh }
+            val gForceList = recentPoints.map { it.gForce }
+            val score = calculateSafetyScore()
 
             _liveData.value = LiveDriveData(
                 speedKmh = speedKmh,
@@ -217,30 +277,19 @@ class DriveTrackingService : Service(), SensorEventListener {
                 stopsCount = stopsCount,
                 leftTurns = leftTurns,
                 rightTurns = rightTurns,
+                brakeEvents = brakeEvents,
                 maxAccelMs2 = maxAccelMs2,
                 maxDecelMs2 = maxDecelMs2,
                 peakGForce = peakGForce,
                 topCornerSpeedKmh = topCornerSpeedKmh,
+                safetyScore = score,
                 isTracking = true,
                 speedHistory = speedList,
                 gForceHistory = gForceList
             )
 
-            if (speedKmh < 2f) {
-                was0 = true
-                accelStartTime = now
-            } else if (was0 && speedKmh >= 100f) {
-                val elapsed = now - accelStartTime
-                if (best0to100Ms == 0L || elapsed < best0to100Ms) {
-                    best0to100Ms = elapsed
-                }
-                was0 = false
-            }
-
-            // Top corner speed
-            if (speedKmh > topCornerSpeedKmh && peakGForce > 0.3f && inTurn) {
-                topCornerSpeedKmh = speedKmh
-            }
+            // Update foreground notification with live speed
+            updateNotification(speedKmh, totalDistanceM / 1000f)
         }
     }
 
@@ -259,7 +308,7 @@ class DriveTrackingService : Service(), SensorEventListener {
 
         val linAccel = sqrt(x * x + y * y + z * z)
         currentLinAccel = linAccel
-        
+
         val currentSpeed = _liveData.value.speedKmh
         val speedDiff = currentSpeed - lastSpeedForAccelCheck
 
@@ -272,7 +321,7 @@ class DriveTrackingService : Service(), SensorEventListener {
         if (linAccel > 2f) {
             if (speedDiff > 0 && linAccel > maxAccelMs2) {
                 maxAccelMs2 = linAccel
-            } else if (speedDiff < 0 && linAccel > 4.5f) {
+            } else if (speedDiff < 0 && linAccel > 6.0f) {
                 if (linAccel > maxDecelMs2) maxDecelMs2 = linAccel
                 if (now - lastBrakeEventTime > 2000) {
                     brakeEvents++
@@ -288,19 +337,25 @@ class DriveTrackingService : Service(), SensorEventListener {
 
     private fun handleGyroscope(event: SensorEvent) {
         val gyroZ = event.values[2]
+        val now = System.currentTimeMillis()
+
+        // Turn detection
+        // Android gyroZ: positive = counter-clockwise from above = left turn
+        //                negative = clockwise from above = right turn
         if (!inTurn) {
-            if (abs(gyroZ) > 0.8f) {
+            if (abs(gyroZ) > TURN_THRESHOLD) {
                 inTurn = true
-                turnDirection = if (gyroZ > 0) 1 else -1
+                turnDirection = if (gyroZ > 0) -1 else 1  // -1 = left, 1 = right
             }
         } else {
-            if (abs(gyroZ) < 0.3f) {
+            if (abs(gyroZ) < TURN_THRESHOLD * 0.35f) {
                 if (turnDirection < 0) leftTurns++ else rightTurns++
                 inTurn = false
                 turnDirection = 0
                 pendingSharpTurn = true
             }
         }
+
         lastGyroZ = gyroZ
     }
 
@@ -311,7 +366,11 @@ class DriveTrackingService : Service(), SensorEventListener {
             .setMinUpdateIntervalMillis(500L)
             .build()
         try {
-            fusedLocationClient.requestLocationUpdates(request, locationCallback, Looper.getMainLooper())
+            fusedLocationClient.requestLocationUpdates(
+                request,
+                locationCallback,
+                locationHandlerThread.looper  // Background thread, not main!
+            )
         } catch (e: SecurityException) {}
     }
 
@@ -332,6 +391,42 @@ class DriveTrackingService : Service(), SensorEventListener {
         sensorManager.unregisterListener(this)
     }
 
+    private fun calculateSafetyScore(): Int {
+        var score = 100
+
+        // Hard emergency brakes: -5 each, capped at -25
+        score -= (brakeEvents * 5).coerceAtMost(25)
+
+        // Peak lateral/total G-force tiers (only penalize genuinely aggressive forces)
+        score -= when {
+            peakGForce > 1.2f -> 20
+            peakGForce > 0.9f -> 12
+            peakGForce > 0.7f -> 5
+            else -> 0
+        }
+
+        return score.coerceIn(0, 100)
+    }
+
+    fun getSafetyGrade(score: Int): String = when {
+        score >= 90 -> "A"
+        score >= 75 -> "B"
+        score >= 60 -> "C"
+        score >= 45 -> "D"
+        else -> "F"
+    }
+
+    private fun generateTripName(): String {
+        val hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
+        return when {
+            hour < 6  -> "Night Drive"
+            hour < 12 -> "Morning Drive"
+            hour < 17 -> "Afternoon Drive"
+            hour < 21 -> "Evening Drive"
+            else      -> "Night Drive"
+        }
+    }
+
     private fun resetSessionState() {
         totalDistanceM = 0f
         stoppedTimeMs = 0L
@@ -345,13 +440,25 @@ class DriveTrackingService : Service(), SensorEventListener {
         leftTurns = 0
         rightTurns = 0
         brakeEvents = 0
-        laneChanges = 0
         lastLocation = null
         was0 = false
         isStopped = true
         inTurn = false
+        turnDirection = 0
+        currentLinAccel = 0f
+        lastSpeedForAccelCheck = 0f
+        lastTimeForAccelCheck = 0L
+        lastBrakeEventTime = 0L
+        pendingHardBrake = false
+        pendingSharpTurn = false
+        lastGyroZ = 0f
+        lastStopStart = 0L
+        pauseStartTime = 0L
+        totalPausedTimeMs = 0L
+        recentPoints.clear()
+        pendingFlush.clear()
+        sessionIdDeferred = null
         _liveData.value = LiveDriveData()
-        sessionDataPoints.clear()
     }
 
     private fun createNotificationChannel() {
@@ -362,13 +469,25 @@ class DriveTrackingService : Service(), SensorEventListener {
             .createNotificationChannel(channel)
     }
 
-    private fun buildNotification(): Notification {
+    private fun buildNotification(speedKmh: Float, distanceKm: Float): Notification {
+        val contentIntent = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE
+        )
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("DriveTracker")
-            .setContentText("Tracking your drive…")
+            .setContentTitle("DriveTracker — Active")
+            .setContentText("${speedKmh.toInt()} km/h  •  ${"%.1f".format(distanceKm)} km")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
+            .setContentIntent(contentIntent)
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
             .build()
+    }
+
+    private fun updateNotification(speedKmh: Float, distanceKm: Float) {
+        val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        manager.notify(NOTIFICATION_ID, buildNotification(speedKmh, distanceKm))
     }
 
     override fun onDestroy() {
@@ -376,6 +495,7 @@ class DriveTrackingService : Service(), SensorEventListener {
         serviceScope.cancel()
         stopLocationUpdates()
         stopSensorUpdates()
+        locationHandlerThread.quitSafely()
     }
 
     companion object {

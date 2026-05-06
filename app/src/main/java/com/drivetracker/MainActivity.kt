@@ -56,6 +56,9 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         Configuration.getInstance().userAgentValue = packageName
         enableEdgeToEdge()
+        // Bind to service for its entire lifetime — not just when visible
+        val intent = Intent(this, DriveTrackingService::class.java)
+        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
         setContent {
             DriveTrackerTheme {
                 val liveData by DriveTrackingService.liveData.collectAsState()
@@ -73,18 +76,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onStart() {
-        super.onStart()
-        val intent = Intent(this, DriveTrackingService::class.java)
-        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
-    }
-
-    override fun onStop() {
-        super.onStop()
+    override fun onDestroy() {
+        super.onDestroy()
         if (serviceBound) {
             unbindService(serviceConnection)
             serviceBound = false
-            trackingService = null
         }
     }
 
