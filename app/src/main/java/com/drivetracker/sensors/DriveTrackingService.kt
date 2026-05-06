@@ -172,19 +172,21 @@ class DriveTrackingService : Service(), SensorEventListener {
             tripName = tripName
         )
 
-        // Flush remaining points then update the session record
+        // Snapshot mutable state NOW before resetSessionState() wipes it
+        val deferredSnapshot  = sessionIdDeferred
+        val remainingPoints   = pendingFlush.toList()
+
+        resetSessionState()          // safe to reset — snapshots above are captured
+        stopForeground(STOP_FOREGROUND_REMOVE)
+
+        // Flush remaining points then write the final session record
         serviceScope.launch {
-            val sessionId = sessionIdDeferred?.await() ?: return@launch
-            if (pendingFlush.isNotEmpty()) {
-                val toFlush = pendingFlush.map { it.copy(sessionId = sessionId) }
-                pendingFlush.clear()
-                repository.saveDataPoints(toFlush)
+            val sessionId = deferredSnapshot?.await() ?: return@launch
+            if (remainingPoints.isNotEmpty()) {
+                repository.saveDataPoints(remainingPoints.map { it.copy(sessionId = sessionId) })
             }
             repository.updateSession(finalSession.copy(id = sessionId))
         }
-
-        resetSessionState()
-        stopForeground(STOP_FOREGROUND_REMOVE)
     }
 
     private val locationCallback = object : LocationCallback() {
